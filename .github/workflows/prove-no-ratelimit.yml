@@ -29,10 +29,10 @@ jobs:
             HTTP=$(curl -sLo /dev/null -w "%{http_code}" --max-time 30 "$URL")
             if [[ "$HTTP" == "200" ]]; then
               echo "  ✓ $i/20 — HTTP $HTTP"
-              ((SUCCESS++))
+              SUCCESS=$((SUCCESS + 1))
             else
               echo "  ✗ $i/20 — HTTP $HTTP  ← rate-limited or error!"
-              ((FAIL++))
+              FAIL=$((FAIL + 1))
             fi
           done
 
@@ -81,10 +81,10 @@ jobs:
               HTTP=$(curl -sLo /dev/null -w "%{http_code}" --max-time 30 "$URL")
               if [[ "$HTTP" == "200" ]]; then
                 echo "  ✓ download $i/20 — HTTP $HTTP"
-                ((ROUND_OK++)); ((TOTAL_OK++))
+                ROUND_OK=$((ROUND_OK + 1)); TOTAL_OK=$((TOTAL_OK + 1))
               else
                 echo "  ✗ download $i/20 — HTTP $HTTP  ← UNEXPECTED!"
-                ((ROUND_FAIL++)); ((TOTAL_FAIL++))
+                ROUND_FAIL=$((ROUND_FAIL + 1)); TOTAL_FAIL=$((TOTAL_FAIL + 1))
               fi
             done
 
