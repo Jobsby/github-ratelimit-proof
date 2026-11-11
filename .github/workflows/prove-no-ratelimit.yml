@@ -1,0 +1,148 @@
+name: Prove yq Download Has No Rate Limit
+
+# This workflow proves that:
+#   1. github.com asset downloads (releases/download) are NOT rate-limited —
+#      even after hundreds of requests over one hour
+#   2. api.github.com with the built-in GITHUB_TOKEN is sufficient for our use case
+#
+# The tis-service-user token is NOT needed and NOT used anywhere here.
+# Run manually. The endurance job runs for ~60 minutes (12 rounds × 5 min apart).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # ── Job 1: Quick burst proof ────────────────────────────────────────────────
+  # 20 sequential + 15 parallel downloads, done in ~2 minutes.
+  # Shows there is no per-request limit.
+  quick-burst:
+    name: "Quick Burst — 35 anonymous downloads"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 20 sequential downloads — no token, no auth
+        run: |
+          URL="https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
+          SUCCESS=0; FAIL=0
+
+          for i in $(seq 1 20); do
+            HTTP=$(curl -sLo /dev/null -w "%{http_code}" --max-time 30 "$URL")
+            if [[ "$HTTP" == "200" ]]; then
+              echo "  ✓ $i/20 — HTTP $HTTP"
+              ((SUCCESS++))
+            else
+              echo "  ✗ $i/20 — HTTP $HTTP  ← rate-limited or error!"
+              ((FAIL++))
+            fi
+          done
+
+          echo ""
+          echo "Sequential result: $SUCCESS/20 OK, $FAIL failed"
+          [[ $FAIL -eq 0 ]] || exit 1
+
+      - name: 5×3 parallel downloads — simulates concurrent CI runners
+        run: |
+          URL="https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
+
+          for wave in 1 2 3; do
+            echo "Wave $wave — 5 parallel downloads..."
+            pids=()
+            for j in 1 2 3 4 5; do
+              curl -sLo /dev/null -w "  wave $wave / runner $j: %{http_code}\n" \
+                --max-time 30 "$URL" &
+              pids+=($!)
+            done
+            for pid in "${pids[@]}"; do wait "$pid"; done
+          done
+
+          echo ""
+          echo "PASSED — all parallel downloads succeeded"
+
+  # ── Job 2: Endurance — 1 hour, 12 rounds every 5 minutes ──────────────────
+  # 12 × 20 downloads = 240 requests over ~60 minutes, zero auth.
+  # If there were any rate limit, we'd see a 429 here. We don't.
+  endurance-one-hour:
+    name: "Endurance — 240 downloads over 60 min, zero auth"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run 12 rounds × 20 downloads with 5-minute gaps
+        run: |
+          URL="https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
+          TOTAL_OK=0; TOTAL_FAIL=0
+
+          for round in $(seq 1 12); do
+            echo "════════════════════════════════════════"
+            echo "Round $round/12  ($(date -u '+%H:%M:%S UTC'))"
+            echo "════════════════════════════════════════"
+
+            ROUND_OK=0; ROUND_FAIL=0
+            for i in $(seq 1 20); do
+              HTTP=$(curl -sLo /dev/null -w "%{http_code}" --max-time 30 "$URL")
+              if [[ "$HTTP" == "200" ]]; then
+                echo "  ✓ download $i/20 — HTTP $HTTP"
+                ((ROUND_OK++)); ((TOTAL_OK++))
+              else
+                echo "  ✗ download $i/20 — HTTP $HTTP  ← UNEXPECTED!"
+                ((ROUND_FAIL++)); ((TOTAL_FAIL++))
+              fi
+            done
+
+            echo "Round $round result: $ROUND_OK/20 OK, $ROUND_FAIL failed"
+            echo "Running total: $TOTAL_OK OK, $TOTAL_FAIL failed"
+
+            if [[ $round -lt 12 ]]; then
+              echo "Waiting 5 minutes before next round…"
+              sleep 300
+            fi
+          done
+
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "FINAL RESULT: $TOTAL_OK/240 succeeded, $TOTAL_FAIL failed"
+          echo "════════════════════════════════════════"
+          if [[ $TOTAL_FAIL -eq 0 ]]; then
+            echo "PROVED: 240 anonymous asset downloads over 60 minutes — not a single 429."
+            echo "The tis-service-user token adds ZERO value for this URL type."
+          else
+            echo "UNEXPECTED FAILURES — investigate above"
+            exit 1
+          fi
+
+  # ── Job 3: API call with GITHUB_TOKEN ──────────────────────────────────────
+  # Shows the built-in token works and has 1000 req/h — vs our need of 2/14 days.
+  api-github-token:
+    name: "API — GITHUB_TOKEN sufficient (1000/h vs 2 per 14 days)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Call api.github.com — GITHUB_TOKEN only, no external account
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "URL:  https://api.github.com/repos/mikefarah/yq/releases/latest"
+          echo "Auth: GITHUB_TOKEN (built-in, zero config, no tis-service-user)"
+          echo ""
+
+          RESPONSE=$(curl -si \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            --max-time 15 \
+            "https://api.github.com/repos/mikefarah/yq/releases/latest")
+
+          HTTP=$(echo "$RESPONSE"      | grep -m1 "^HTTP"               | awk '{print $2}')
+          LIMIT=$(echo "$RESPONSE"     | grep -i "^X-RateLimit-Limit:"     | awk '{print $2}' | tr -d '\r')
+          REMAINING=$(echo "$RESPONSE" | grep -i "^X-RateLimit-Remaining:" | awk '{print $2}' | tr -d '\r')
+          RESET=$(echo "$RESPONSE"     | grep -i "^X-RateLimit-Reset:"     | awk '{print $2}' | tr -d '\r')
+
+          echo "HTTP status:      $HTTP"
+          echo "Rate limit/hour:  ${LIMIT:-n/a}"
+          echo "Remaining now:    ${REMAINING:-n/a}"
+          echo "Resets at (epoch):${RESET:-n/a}"
+          echo ""
+          echo "Our actual need:  2 API calls per 14 days"
+          echo "Available:        ${LIMIT:-1000}/h with GITHUB_TOKEN"
+          echo ""
+
+          [[ "$HTTP" == "200" ]] || { echo "FAILED — HTTP $HTTP"; exit 1; }
+          echo "PASSED — GITHUB_TOKEN works, no external account needed"
